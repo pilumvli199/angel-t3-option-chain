@@ -160,12 +160,6 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
     
     logger.info(f"🔍 Finding options for {symbol}, Target Expiry: {target_expiry}, Price: {current_price}")
     
-    # Parse target expiry
-    target_date = parse_expiry_formats(target_expiry)
-    if not target_date:
-        logger.error(f"Failed to parse target expiry: {target_expiry}")
-        return []
-    
     # Calculate ATM and surrounding strikes
     if symbol == "NIFTY":
         strike_gap = 50
@@ -191,35 +185,31 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
         # Collect expiry samples for debugging
         if inst_name == symbol and inst_expiry:
             expiry_samples.add(inst_expiry)
-            if len(expiry_samples) <= 5:  # Log first 5 unique expiries
-                logger.debug(f"Sample expiry for {symbol}: {inst_expiry}")
         
-        if inst_name == symbol:
-            # Parse instrument expiry
-            inst_date = parse_expiry_formats(inst_expiry)
-            
-            # Match expiry date
-            if inst_date and inst_date.date() == target_date.date():
-                strike = float(instrument.get('strike', 0))
-                if strike in strikes:
-                    symbol_name = instrument.get('symbol', '')
-                    option_type = 'CE' if 'CE' in symbol_name else 'PE'
-                    token = instrument.get('token')
-                    option_tokens.append({
-                        'strike': strike,
-                        'type': option_type,
-                        'token': token,
-                        'symbol': symbol_name,
-                        'expiry': inst_expiry
-                    })
+        # Direct string match for expiry
+        if inst_name == symbol and inst_expiry == target_expiry:
+            strike = float(instrument.get('strike', 0))
+            if strike > 0 and strike in strikes:
+                symbol_name = instrument.get('symbol', '')
+                option_type = 'CE' if 'CE' in symbol_name else 'PE'
+                token = instrument.get('token')
+                option_tokens.append({
+                    'strike': strike,
+                    'type': option_type,
+                    'token': token,
+                    'symbol': symbol_name,
+                    'expiry': inst_expiry
+                })
     
     logger.info(f"📋 Found {len(expiry_samples)} unique expiries for {symbol}")
     logger.info(f"✅ Found {len(option_tokens)} option contracts matching {target_expiry}")
     
     if option_tokens:
-        logger.debug(f"Sample options: {option_tokens[:2]}")
+        logger.info(f"Sample matched options: {option_tokens[:2]}")
     else:
-        logger.warning(f"⚠️ No options found! Available expiries for {symbol}: {sorted(list(expiry_samples))[:10]}")
+        available = sorted(list(expiry_samples))[:10]
+        logger.warning(f"⚠️ No options found!")
+        logger.warning(f"Target: {target_expiry}, Available: {available}")
     
     return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
@@ -428,11 +418,10 @@ def bot_loop():
             # Get spot prices
             spot_prices = get_spot_prices(smartApi)
             
-            if not spot_prices:
-                logger.error("❌ Failed to fetch spot prices")
-                tele_send_http(TELE_CHAT_ID, "⚠️ Unable to fetch spot prices. Market closed?")
-                time.sleep(POLL_INTERVAL)
-                continue
+            # If market closed, use dummy prices for testing
+            if not spot_prices or all(v == 0 for v in spot_prices.values()):
+                logger.warning("⚠️ Market appears to be closed. Using dummy prices for testing.")
+                spot_prices = {'NIFTY': 25000, 'BANKNIFTY': 52000}
             
             # Process NIFTY
             if 'NIFTY' in spot_prices:
