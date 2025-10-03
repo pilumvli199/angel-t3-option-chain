@@ -87,8 +87,8 @@ def get_nifty_expiry():
     if days_ahead <= 0:  # If today is Tuesday or later, get next Tuesday
         days_ahead += 7
     expiry = today + timedelta(days=days_ahead)
-    # Format: DDMMMYY (e.g., 07OCT25)
-    return expiry.strftime('%d%b%y').upper()
+    # Format: DDMMMYYYY (e.g., 07OCT2025) - Angel One uses 4-digit year
+    return expiry.strftime('%d%b%Y').upper()
 
 def get_banknifty_expiry():
     """Get BANKNIFTY monthly expiry (last Wednesday of month)"""
@@ -105,8 +105,8 @@ def get_banknifty_expiry():
     days_back = (last_day.weekday() - 2) % 7
     last_wednesday = last_day - timedelta(days=days_back)
     
-    # Format: DDMMMYY (e.g., 30OCT25)
-    return last_wednesday.strftime('%d%b%y').upper()
+    # Format: DDMMMYYYY (e.g., 30OCT2025) - Angel One uses 4-digit year
+    return last_wednesday.strftime('%d%b%Y').upper()
 
 def parse_expiry_formats(expiry_str):
     """Parse different expiry date formats from Angel One
