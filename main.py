@@ -79,14 +79,33 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         pass
     return smartApi, authToken, refreshToken, feedToken
 
-def get_current_expiry():
-    """Get current week's expiry (Thursday)"""
+def get_nifty_expiry():
+    """Get NIFTY 50 weekly expiry (next Tuesday)"""
     today = datetime.now()
-    days_ahead = 3 - today.weekday()  # Thursday is 3
-    if days_ahead <= 0:
+    # Tuesday is 1 (Monday=0, Tuesday=1, ...)
+    days_ahead = 1 - today.weekday()
+    if days_ahead <= 0:  # If today is Tuesday or later, get next Tuesday
         days_ahead += 7
     expiry = today + timedelta(days=days_ahead)
     return expiry.strftime('%d%b%y').upper()
+
+def get_banknifty_expiry():
+    """Get BANKNIFTY monthly expiry (last Wednesday of month)"""
+    today = datetime.now()
+    # Get last day of current month
+    if today.month == 12:
+        next_month = datetime(today.year + 1, 1, 1)
+    else:
+        next_month = datetime(today.year, today.month + 1, 1)
+    
+    last_day = next_month - timedelta(days=1)
+    
+    # Find last Wednesday
+    # Wednesday is 2
+    days_back = (last_day.weekday() - 2) % 7
+    last_wednesday = last_day - timedelta(days=days_back)
+    
+    return last_wednesday.strftime('%d%b%y').upper()
 
 def download_instruments(smartApi):
     """Download instrument master file from Angel One"""
@@ -345,9 +364,10 @@ def bot_loop():
         tele_send_http(TELE_CHAT_ID, error_msg)
         return
     
-    expiry = get_current_expiry()
-    logger.info(f"📅 Current expiry: {expiry}")
-    tele_send_http(TELE_CHAT_ID, f"📅 Using expiry: {expiry}")
+    nifty_expiry = get_nifty_expiry()
+    banknifty_expiry = get_banknifty_expiry()
+    logger.info(f"📅 NIFTY expiry: {nifty_expiry}, BANKNIFTY expiry: {banknifty_expiry}")
+    tele_send_http(TELE_CHAT_ID, f"📅 NIFTY expiry: {nifty_expiry}\n📅 BANKNIFTY expiry: {banknifty_expiry}")
 
     iteration = 0
     while True:
@@ -370,12 +390,12 @@ def bot_loop():
             if 'NIFTY' in spot_prices:
                 logger.info(f"\n--- Processing NIFTY ---")
                 nifty_price = spot_prices['NIFTY']
-                nifty_options = find_option_tokens(instruments, 'NIFTY', expiry, nifty_price)
+                nifty_options = find_option_tokens(instruments, 'NIFTY', nifty_expiry, nifty_price)
                 
                 if nifty_options:
                     ltp_data = get_option_chain_data(smartApi, nifty_options)
                     if ltp_data:
-                        msg = format_option_chain_message('NIFTY 50', nifty_price, expiry, nifty_options, ltp_data)
+                        msg = format_option_chain_message('NIFTY 50', nifty_price, nifty_expiry, nifty_options, ltp_data)
                         tele_send_http(TELE_CHAT_ID, msg)
                         logger.info("✅ NIFTY data sent to Telegram")
                         time.sleep(2)
@@ -388,12 +408,12 @@ def bot_loop():
             if 'BANKNIFTY' in spot_prices:
                 logger.info(f"\n--- Processing BANKNIFTY ---")
                 bn_price = spot_prices['BANKNIFTY']
-                bn_options = find_option_tokens(instruments, 'BANKNIFTY', expiry, bn_price)
+                bn_options = find_option_tokens(instruments, 'BANKNIFTY', banknifty_expiry, bn_price)
                 
                 if bn_options:
                     ltp_data = get_option_chain_data(smartApi, bn_options)
                     if ltp_data:
-                        msg = format_option_chain_message('BANK NIFTY', bn_price, expiry, bn_options, ltp_data)
+                        msg = format_option_chain_message('BANK NIFTY', bn_price, banknifty_expiry, bn_options, ltp_data)
                         tele_send_http(TELE_CHAT_ID, msg)
                         logger.info("✅ BANKNIFTY data sent to Telegram")
                     else:
