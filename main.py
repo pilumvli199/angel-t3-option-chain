@@ -193,7 +193,13 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
         
         # Direct string match for expiry
         if inst_name == symbol and inst_expiry == target_expiry:
-            strike = float(instrument.get('strike', 0) / 100)  # Strike is in paise, convert to rupees
+            strike_raw = instrument.get('strike', '0')
+            try:
+                # Strike is in paise (as string), convert to rupees
+                strike = float(strike_raw) / 100
+            except (ValueError, TypeError):
+                continue
+                
             if strike > 0 and strike in strikes:
                 matched_strikes.add(strike)
                 symbol_name = instrument.get('symbol', '')
@@ -411,7 +417,22 @@ def bot_loop():
     
     nifty_expiry = get_nifty_expiry()
     banknifty_expiry = get_banknifty_expiry()
-    logger.info(f"📅 NIFTY expiry: {nifty_expiry}, BANKNIFTY expiry: {banknifty_expiry}")
+    
+    # Override if not matching available expiries
+    logger.info("🔍 Checking available expiries in instruments...")
+    nifty_expiries = sorted([i.get('expiry') for i in instruments if i.get('name') == 'NIFTY' and i.get('expiry')])
+    bn_expiries = sorted([i.get('expiry') for i in instruments if i.get('name') == 'BANKNIFTY' and i.get('expiry')])
+    
+    # Get nearest expiry if calculated one not available
+    if nifty_expiry not in nifty_expiries and nifty_expiries:
+        nifty_expiry = nifty_expiries[0]
+        logger.info(f"📅 Using nearest NIFTY expiry: {nifty_expiry}")
+    
+    if banknifty_expiry not in bn_expiries and bn_expiries:
+        banknifty_expiry = bn_expiries[0]
+        logger.info(f"📅 Using nearest BANKNIFTY expiry: {banknifty_expiry}")
+    
+    logger.info(f"📅 Final - NIFTY: {nifty_expiry}, BANKNIFTY: {banknifty_expiry}")
     tele_send_http(TELE_CHAT_ID, f"📅 NIFTY expiry: {nifty_expiry}\n📅 BANKNIFTY expiry: {banknifty_expiry}")
 
     iteration = 0
