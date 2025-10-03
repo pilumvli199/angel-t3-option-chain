@@ -93,6 +93,7 @@ def get_nifty_expiry():
 def get_banknifty_expiry():
     """Get BANKNIFTY monthly expiry (last Wednesday of month)"""
     today = datetime.now()
+    
     # Get last day of current month
     if today.month == 12:
         next_month = datetime(today.year + 1, 1, 1)
@@ -102,11 +103,13 @@ def get_banknifty_expiry():
     last_day = next_month - timedelta(days=1)
     
     # Find last Wednesday (weekday 2)
-    days_back = (last_day.weekday() - 2) % 7
-    last_wednesday = last_day - timedelta(days=days_back)
+    # If last day is Wednesday or later in week, go back
+    # If last day is before Wednesday, go to previous week's Wednesday
+    while last_day.weekday() != 2:  # 2 = Wednesday
+        last_day = last_day - timedelta(days=1)
     
-    # Format: DDMMMYYYY (e.g., 30OCT2025) - Angel One uses 4-digit year
-    return last_wednesday.strftime('%d%b%Y').upper()
+    # Format: DDMMMYYYY (e.g., 28OCT2025) - Angel One uses 4-digit year
+    return last_day.strftime('%d%b%Y').upper()
 
 def parse_expiry_formats(expiry_str):
     """Parse different expiry date formats from Angel One
@@ -173,10 +176,12 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
     for i in range(-5, 6):
         strikes.append(atm + (i * strike_gap))
     
-    logger.info(f"🎯 ATM: {atm}, Looking for strikes: {strikes[:3]}...{strikes[-3:]}")
+    logger.info(f"🎯 ATM: {atm}, Strike gap: {strike_gap}")
+    logger.info(f"🎯 Looking for strikes: {min(strikes)} to {max(strikes)}")
     
     option_tokens = []
     expiry_samples = set()
+    matched_strikes = set()
     
     for instrument in instruments:
         inst_name = instrument.get('name', '')
@@ -188,8 +193,9 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
         
         # Direct string match for expiry
         if inst_name == symbol and inst_expiry == target_expiry:
-            strike = float(instrument.get('strike', 0))
+            strike = float(instrument.get('strike', 0) / 100)  # Strike is in paise, convert to rupees
             if strike > 0 and strike in strikes:
+                matched_strikes.add(strike)
                 symbol_name = instrument.get('symbol', '')
                 option_type = 'CE' if 'CE' in symbol_name else 'PE'
                 token = instrument.get('token')
@@ -202,6 +208,7 @@ def find_option_tokens(instruments, symbol, target_expiry, current_price):
                 })
     
     logger.info(f"📋 Found {len(expiry_samples)} unique expiries for {symbol}")
+    logger.info(f"🎯 Matched strikes: {sorted(matched_strikes)}")
     logger.info(f"✅ Found {len(option_tokens)} option contracts matching {target_expiry}")
     
     if option_tokens:
