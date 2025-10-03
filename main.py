@@ -17,7 +17,7 @@ except Exception as e:
     logging.error(f"Failed to import SmartConnect: {e}")
     SmartConnect = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('angel-option-chain-bot')
 
 # Load config from env
@@ -66,9 +66,12 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         raise RuntimeError(f"Login failed: {data}")
     authToken = data['data']['jwtToken']
     refreshToken = data['data']['refreshToken']
+    logger.info(f"✅ Login successful! Auth token: {authToken[:20]}...")
     try:
         feedToken = smartApi.getfeedToken()
-    except Exception:
+        logger.info(f"Feed token: {feedToken}")
+    except Exception as e:
+        logger.warning(f"Feed token failed: {e}")
         feedToken = None
     try:
         smartApi.generateToken(refreshToken)
@@ -88,21 +91,33 @@ def get_current_expiry():
 def download_instruments(smartApi):
     """Download instrument master file from Angel One"""
     try:
+        logger.info("📥 Downloading instruments master file...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         response = requests.get(url, timeout=30)
         if response.status_code == 200:
             instruments = response.json()
-            logger.info(f"Downloaded {len(instruments)} instruments")
+            logger.info(f"✅ Downloaded {len(instruments)} instruments")
+            
+            # Count NIFTY and BANKNIFTY options
+            nifty_count = sum(1 for i in instruments if i.get('name') == 'NIFTY')
+            bn_count = sum(1 for i in instruments if i.get('name') == 'BANKNIFTY')
+            logger.info(f"📊 NIFTY options: {nifty_count}, BANKNIFTY options: {bn_count}")
+            
             return instruments
+        else:
+            logger.error(f"Failed to download instruments: {response.status_code}")
         return None
     except Exception as e:
-        logger.exception(f"Failed to download instruments: {e}")
+        logger.exception(f"❌ Failed to download instruments: {e}")
         return None
 
 def find_option_tokens(instruments, symbol, expiry, current_price):
     """Find option tokens for strikes around current price"""
     if not instruments:
+        logger.error("No instruments available!")
         return []
+    
+    logger.info(f"🔍 Finding options for {symbol}, Expiry: {expiry}, Price: {current_price}")
     
     # Calculate ATM and surrounding strikes
     if symbol == "NIFTY":
@@ -117,20 +132,27 @@ def find_option_tokens(instruments, symbol, expiry, current_price):
     for i in range(-5, 6):
         strikes.append(atm + (i * strike_gap))
     
+    logger.info(f"🎯 ATM: {atm}, Looking for strikes: {strikes[:3]}...{strikes[-3:]}")
+    
     option_tokens = []
     
     for instrument in instruments:
         if instrument.get('name') == symbol and instrument.get('expiry') == expiry:
             strike = float(instrument.get('strike', 0))
             if strike in strikes:
-                option_type = instrument.get('symbol', '')[-2:]  # CE or PE
+                symbol_name = instrument.get('symbol', '')
+                option_type = 'CE' if 'CE' in symbol_name else 'PE'
                 token = instrument.get('token')
                 option_tokens.append({
                     'strike': strike,
                     'type': option_type,
                     'token': token,
-                    'symbol': instrument.get('symbol')
+                    'symbol': symbol_name
                 })
+    
+    logger.info(f"✅ Found {len(option_tokens)} option contracts")
+    if option_tokens:
+        logger.debug(f"Sample options: {option_tokens[:2]}")
     
     return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
@@ -138,7 +160,10 @@ def get_option_chain_data(smartApi, option_tokens):
     """Fetch option chain LTP data"""
     try:
         if not option_tokens:
+            logger.warning("No option tokens provided")
             return {}
+        
+        logger.info(f"📡 Fetching LTP for {len(option_tokens)} options...")
         
         headers = {
             'Authorization': f'Bearer {smartApi.access_token}',
@@ -152,11 +177,8 @@ def get_option_chain_data(smartApi, option_tokens):
             'X-PrivateKey': API_KEY
         }
         
-        # Split CE and PE tokens
-        ce_tokens = [opt['token'] for opt in option_tokens if opt['type'] == 'CE']
-        pe_tokens = [opt['token'] for opt in option_tokens if opt['type'] == 'PE']
-        
-        all_tokens = ce_tokens + pe_tokens
+        all_tokens = [opt['token'] for opt in option_tokens]
+        logger.debug(f"Tokens to fetch: {all_tokens[:5]}...")
         
         payload = {
             "mode": "LTP",
@@ -172,26 +194,41 @@ def get_option_chain_data(smartApi, option_tokens):
             timeout=15
         )
         
+        logger.info(f"API Response Status: {response.status_code}")
+        
         if response.status_code == 200:
             data = response.json()
+            logger.debug(f"Response data: {data}")
+            
             if data.get('status'):
                 result = {}
                 fetched = data.get('data', {}).get('fetched', [])
+                logger.info(f"✅ Fetched data for {len(fetched)} instruments")
+                
                 for item in fetched:
                     token = item.get('symbolToken', '')
                     ltp = float(item.get('ltp', 0))
                     result[token] = ltp
+                
+                if result:
+                    logger.info(f"Sample LTP data: {list(result.items())[:3]}")
                 return result
+            else:
+                logger.error(f"API returned status=false: {data}")
+        else:
+            logger.error(f"API error: {response.text}")
         
         return {}
         
     except Exception as e:
-        logger.exception(f"Failed to fetch option chain data: {e}")
+        logger.exception(f"❌ Failed to fetch option chain data: {e}")
         return {}
 
 def get_spot_prices(smartApi):
     """Get NIFTY and BANKNIFTY spot prices"""
     try:
+        logger.info("📊 Fetching spot prices...")
+        
         headers = {
             'Authorization': f'Bearer {smartApi.access_token}',
             'Content-Type': 'application/json',
@@ -218,24 +255,34 @@ def get_spot_prices(smartApi):
             timeout=10
         )
         
+        logger.info(f"Spot API Status: {response.status_code}")
+        
         if response.status_code == 200:
             data = response.json()
             if data.get('status'):
                 result = {}
                 fetched = data.get('data', {}).get('fetched', [])
+                logger.info(f"Spot data fetched: {len(fetched)} indices")
+                
                 for item in fetched:
                     token = item.get('symbolToken', '')
                     ltp = float(item.get('ltp', 0))
                     if token == '99926000':
                         result['NIFTY'] = ltp
+                        logger.info(f"✅ NIFTY: ₹{ltp:,.2f}")
                     elif token == '99926009':
                         result['BANKNIFTY'] = ltp
+                        logger.info(f"✅ BANKNIFTY: ₹{ltp:,.2f}")
                 return result
+            else:
+                logger.error(f"Spot API status=false: {data}")
+        else:
+            logger.error(f"Spot API error: {response.text}")
         
         return {}
         
     except Exception as e:
-        logger.exception(f"Failed to fetch spot prices: {e}")
+        logger.exception(f"❌ Failed to fetch spot prices: {e}")
         return {}
 
 def format_option_chain_message(symbol, spot_price, expiry, option_data, ltp_data):
@@ -276,42 +323,52 @@ def format_option_chain_message(symbol, spot_price, expiry, option_data, ltp_dat
 
 def bot_loop():
     if not all(REQUIRED):
-        logger.error('Missing required environment variables. Bot will not start.')
+        logger.error('❌ Missing required environment variables. Bot will not start.')
         return
 
     try:
         smartApi, authToken, refreshToken, feedToken = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
         logger.info("✅ Login successful!")
     except Exception as e:
-        logger.exception('Login/setup failed: %s', e)
+        logger.exception('❌ Login/setup failed: %s', e)
         tele_send_http(TELE_CHAT_ID, f'❌ Login failed: {e}')
         return
 
-    tele_send_http(TELE_CHAT_ID, f"✅ Option Chain Bot started!\n⏱ Polling every {POLL_INTERVAL}s")
+    tele_send_http(TELE_CHAT_ID, f"✅ Option Chain Bot started!\n⏱ Polling every {POLL_INTERVAL}s\n🔄 Initializing...")
     
     # Download instruments once
-    logger.info("Downloading instruments...")
+    logger.info("📥 Downloading instruments...")
     instruments = download_instruments(smartApi)
     if not instruments:
-        logger.error("Failed to download instruments")
-        tele_send_http(TELE_CHAT_ID, "❌ Failed to download instruments")
+        error_msg = "❌ Failed to download instruments. Bot cannot continue."
+        logger.error(error_msg)
+        tele_send_http(TELE_CHAT_ID, error_msg)
         return
     
     expiry = get_current_expiry()
-    logger.info(f"Current expiry: {expiry}")
+    logger.info(f"📅 Current expiry: {expiry}")
+    tele_send_http(TELE_CHAT_ID, f"📅 Using expiry: {expiry}")
 
+    iteration = 0
     while True:
         try:
+            iteration += 1
+            logger.info(f"\n{'='*50}")
+            logger.info(f"🔄 Iteration #{iteration} - {time.strftime('%H:%M:%S')}")
+            logger.info(f"{'='*50}")
+            
             # Get spot prices
             spot_prices = get_spot_prices(smartApi)
             
             if not spot_prices:
-                logger.error("Failed to fetch spot prices")
+                logger.error("❌ Failed to fetch spot prices")
+                tele_send_http(TELE_CHAT_ID, "⚠️ Unable to fetch spot prices. Market closed?")
                 time.sleep(POLL_INTERVAL)
                 continue
             
             # Process NIFTY
             if 'NIFTY' in spot_prices:
+                logger.info(f"\n--- Processing NIFTY ---")
                 nifty_price = spot_prices['NIFTY']
                 nifty_options = find_option_tokens(instruments, 'NIFTY', expiry, nifty_price)
                 
@@ -320,10 +377,16 @@ def bot_loop():
                     if ltp_data:
                         msg = format_option_chain_message('NIFTY 50', nifty_price, expiry, nifty_options, ltp_data)
                         tele_send_http(TELE_CHAT_ID, msg)
-                        time.sleep(2)  # Small delay between messages
+                        logger.info("✅ NIFTY data sent to Telegram")
+                        time.sleep(2)
+                    else:
+                        logger.warning("⚠️ No LTP data received for NIFTY options")
+                else:
+                    logger.warning("⚠️ No NIFTY option contracts found")
             
             # Process BANKNIFTY
             if 'BANKNIFTY' in spot_prices:
+                logger.info(f"\n--- Processing BANKNIFTY ---")
                 bn_price = spot_prices['BANKNIFTY']
                 bn_options = find_option_tokens(instruments, 'BANKNIFTY', expiry, bn_price)
                 
@@ -332,10 +395,17 @@ def bot_loop():
                     if ltp_data:
                         msg = format_option_chain_message('BANK NIFTY', bn_price, expiry, bn_options, ltp_data)
                         tele_send_http(TELE_CHAT_ID, msg)
+                        logger.info("✅ BANKNIFTY data sent to Telegram")
+                    else:
+                        logger.warning("⚠️ No LTP data received for BANKNIFTY options")
+                else:
+                    logger.warning("⚠️ No BANKNIFTY option contracts found")
+            
+            logger.info(f"✅ Iteration #{iteration} complete. Sleeping {POLL_INTERVAL}s...")
             
         except Exception as e:
-            logger.exception(f"Error in bot loop: {e}")
-            tele_send_http(TELE_CHAT_ID, f"⚠️ Error: {str(e)[:100]}")
+            logger.exception(f"❌ Error in bot loop iteration #{iteration}: {e}")
+            tele_send_http(TELE_CHAT_ID, f"⚠️ Error #{iteration}: {str(e)[:100]}")
         
         time.sleep(POLL_INTERVAL)
 
@@ -349,7 +419,8 @@ def index():
         'bot_thread_alive': thread.is_alive(),
         'poll_interval': POLL_INTERVAL,
         'smartapi_sdk_available': SmartConnect is not None,
-        'service': 'Option Chain Bot'
+        'service': 'Angel One Option Chain Bot',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     return jsonify(status)
 
