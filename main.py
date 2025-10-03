@@ -2,15 +2,23 @@ import os
 import time
 import threading
 import logging
-from pathlib import Path
 from flask import Flask, jsonify
 import pyotp
-from SmartApi.smartConnect import SmartConnect
-from telegram import Bot
+import requests
+from datetime import datetime, timedelta
 
-# Basic logging
+# ---- SmartAPI import ----
+SmartConnect = None
+try:
+    from SmartApi import SmartConnect as _SC
+    SmartConnect = _SC
+    logging.info("SmartConnect imported successfully!")
+except Exception as e:
+    logging.error(f"Failed to import SmartConnect: {e}")
+    SmartConnect = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger('angel-railway-bot')
+logger = logging.getLogger('angel-option-chain-bot')
 
 # Load config from env
 API_KEY = os.getenv('SMARTAPI_API_KEY')
@@ -25,13 +33,31 @@ REQUIRED = [API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET, TELE_TOKEN, TELE_CHAT_ID]
 
 app = Flask(__name__)
 
-def tele_send(bot: Bot, chat_id: str, text: str):
+def tele_send_http(chat_id: str, text: str):
+    """Send message using Telegram Bot HTTP API via requests (synchronous)."""
     try:
-        bot.send_message(chat_id=chat_id, text=text)
+        token = TELE_TOKEN
+        if not token:
+            logger.error('TELEGRAM_BOT_TOKEN not set, cannot send Telegram message.')
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logger.warning('Telegram API returned %s: %s', r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
-        logger.exception('Telegram send failed: %s', e)
+        logger.exception('Failed to send Telegram message: %s', e)
+        return False
 
 def login_and_setup(api_key, client_id, password, totp_secret):
+    if SmartConnect is None:
+        raise RuntimeError('SmartAPI SDK not available. Check requirements.txt installation.')
     smartApi = SmartConnect(api_key=api_key)
     totp = pyotp.TOTP(totp_secret).now()
     logger.info('Logging in to SmartAPI...')
@@ -40,122 +66,296 @@ def login_and_setup(api_key, client_id, password, totp_secret):
         raise RuntimeError(f"Login failed: {data}")
     authToken = data['data']['jwtToken']
     refreshToken = data['data']['refreshToken']
-    logger.info('Login successful, fetching feed token...')
     try:
         feedToken = smartApi.getfeedToken()
     except Exception:
         feedToken = None
-    # generateToken if needed
     try:
         smartApi.generateToken(refreshToken)
     except Exception:
-        logger.debug('generateToken not required or failed silently')
+        pass
     return smartApi, authToken, refreshToken, feedToken
 
-def find_symboltoken_for_query(smartApi, query):
-    logger.info(f"Searching symbol for: {query}")
+def get_current_expiry():
+    """Get current week's expiry (Thursday)"""
+    today = datetime.now()
+    days_ahead = 3 - today.weekday()  # Thursday is 3
+    if days_ahead <= 0:
+        days_ahead += 7
+    expiry = today + timedelta(days=days_ahead)
+    return expiry.strftime('%d%b%y').upper()
+
+def download_instruments(smartApi):
+    """Download instrument master file from Angel One"""
     try:
-        res = smartApi.searchScrip(query)
-    except TypeError:
-        try:
-            res = smartApi.searchScrip('NSE', query)
-        except Exception as e:
-            logger.exception('searchScrip failed: %s', e)
-            return None
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            instruments = response.json()
+            logger.info(f"Downloaded {len(instruments)} instruments")
+            return instruments
+        return None
     except Exception as e:
-        logger.exception('searchScrip failed: %s', e)
+        logger.exception(f"Failed to download instruments: {e}")
         return None
 
-    try:
-        candidates = res.get('data') if isinstance(res, dict) and 'data' in res else res
-        if not candidates:
-            return None
-        first = candidates[0]
-        token = first.get('symboltoken') or first.get('token') or first.get('symbolToken')
-        tradingsymbol = first.get('tradingsymbol') or first.get('tradingsymbol') or first.get('symbol')
-        return {'symboltoken': str(token), 'tradingsymbol': tradingsymbol}
-    except Exception:
-        logger.exception('Parsing searchScrip response failed')
-        return None
+def find_option_tokens(instruments, symbol, expiry, current_price):
+    """Find option tokens for strikes around current price"""
+    if not instruments:
+        return []
+    
+    # Calculate ATM and surrounding strikes
+    if symbol == "NIFTY":
+        strike_gap = 50
+    else:  # BANKNIFTY
+        strike_gap = 100
+    
+    atm = round(current_price / strike_gap) * strike_gap
+    strikes = []
+    
+    # Get 5 strikes above and 5 below ATM
+    for i in range(-5, 6):
+        strikes.append(atm + (i * strike_gap))
+    
+    option_tokens = []
+    
+    for instrument in instruments:
+        if instrument.get('name') == symbol and instrument.get('expiry') == expiry:
+            strike = float(instrument.get('strike', 0))
+            if strike in strikes:
+                option_type = instrument.get('symbol', '')[-2:]  # CE or PE
+                token = instrument.get('token')
+                option_tokens.append({
+                    'strike': strike,
+                    'type': option_type,
+                    'token': token,
+                    'symbol': instrument.get('symbol')
+                })
+    
+    return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
-def get_ltp(smartApi, exchange, tradingsymbol, symboltoken):
+def get_option_chain_data(smartApi, option_tokens):
+    """Fetch option chain LTP data"""
     try:
-        data = smartApi.ltpData(exchange, tradingsymbol, symboltoken)
-        if isinstance(data, dict) and data.get('status') is not False:
-            d = data.get('data') if isinstance(data.get('data'), dict) else data
-            ltp = None
-            if isinstance(d, dict):
-                ltp = d.get('ltp') or d.get('last_price') or d.get('ltpValue')
-            if ltp is None and isinstance(d, list) and len(d) > 0:
-                entry = d[0]
-                ltp = entry.get('ltp') or entry.get('last_price')
-            return float(ltp) if ltp is not None else None
-        else:
-            logger.warning('ltpData returned unexpected: %s', data)
-            return None
-    except Exception:
-        logger.exception('ltpData call failed')
-        return None
+        if not option_tokens:
+            return {}
+        
+        headers = {
+            'Authorization': f'Bearer {smartApi.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-UserType': 'USER',
+            'X-SourceID': 'WEB',
+            'X-ClientLocalIP': '127.0.0.1',
+            'X-ClientPublicIP': '127.0.0.1',
+            'X-MACAddress': '00:00:00:00:00:00',
+            'X-PrivateKey': API_KEY
+        }
+        
+        # Split CE and PE tokens
+        ce_tokens = [opt['token'] for opt in option_tokens if opt['type'] == 'CE']
+        pe_tokens = [opt['token'] for opt in option_tokens if opt['type'] == 'PE']
+        
+        all_tokens = ce_tokens + pe_tokens
+        
+        payload = {
+            "mode": "LTP",
+            "exchangeTokens": {
+                "NFO": all_tokens
+            }
+        }
+        
+        response = requests.post(
+            'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status'):
+                result = {}
+                fetched = data.get('data', {}).get('fetched', [])
+                for item in fetched:
+                    token = item.get('symbolToken', '')
+                    ltp = float(item.get('ltp', 0))
+                    result[token] = ltp
+                return result
+        
+        return {}
+        
+    except Exception as e:
+        logger.exception(f"Failed to fetch option chain data: {e}")
+        return {}
+
+def get_spot_prices(smartApi):
+    """Get NIFTY and BANKNIFTY spot prices"""
+    try:
+        headers = {
+            'Authorization': f'Bearer {smartApi.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-UserType': 'USER',
+            'X-SourceID': 'WEB',
+            'X-ClientLocalIP': '127.0.0.1',
+            'X-ClientPublicIP': '127.0.0.1',
+            'X-MACAddress': '00:00:00:00:00:00',
+            'X-PrivateKey': API_KEY
+        }
+        
+        payload = {
+            "mode": "LTP",
+            "exchangeTokens": {
+                "NSE": ['99926000', '99926009']  # NIFTY, BANKNIFTY
+            }
+        }
+        
+        response = requests.post(
+            'https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status'):
+                result = {}
+                fetched = data.get('data', {}).get('fetched', [])
+                for item in fetched:
+                    token = item.get('symbolToken', '')
+                    ltp = float(item.get('ltp', 0))
+                    if token == '99926000':
+                        result['NIFTY'] = ltp
+                    elif token == '99926009':
+                        result['BANKNIFTY'] = ltp
+                return result
+        
+        return {}
+        
+    except Exception as e:
+        logger.exception(f"Failed to fetch spot prices: {e}")
+        return {}
+
+def format_option_chain_message(symbol, spot_price, expiry, option_data, ltp_data):
+    """Format option chain data for Telegram"""
+    messages = []
+    messages.append(f"📊 <b>{symbol} OPTION CHAIN</b>")
+    messages.append(f"💰 Spot: ₹{spot_price:,.2f}")
+    messages.append(f"📅 Expiry: {expiry}")
+    messages.append(f"\n{'─'*35}")
+    messages.append(f"<b>{'CALL':<12} {'STRIKE':>8} {'PUT':>12}</b>")
+    messages.append(f"{'─'*35}")
+    
+    # Group by strike
+    strikes = {}
+    for opt in option_data:
+        strike = opt['strike']
+        if strike not in strikes:
+            strikes[strike] = {'CE': 0, 'PE': 0}
+        
+        token = opt['token']
+        ltp = ltp_data.get(token, 0)
+        strikes[strike][opt['type']] = ltp
+    
+    # Display sorted by strike
+    for strike in sorted(strikes.keys()):
+        ce_ltp = strikes[strike]['CE']
+        pe_ltp = strikes[strike]['PE']
+        
+        ce_str = f"₹{ce_ltp:.2f}" if ce_ltp > 0 else "-"
+        pe_str = f"₹{pe_ltp:.2f}" if pe_ltp > 0 else "-"
+        
+        messages.append(f"{ce_str:<12} {int(strike):>8} {pe_str:>12}")
+    
+    messages.append(f"{'─'*35}")
+    messages.append(f"🕐 {time.strftime('%H:%M:%S')}")
+    
+    return "\n".join(messages)
 
 def bot_loop():
     if not all(REQUIRED):
         logger.error('Missing required environment variables. Bot will not start.')
         return
 
-    bot = Bot(token=TELE_TOKEN)
-
     try:
         smartApi, authToken, refreshToken, feedToken = login_and_setup(API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET)
+        logger.info("✅ Login successful!")
     except Exception as e:
         logger.exception('Login/setup failed: %s', e)
-        tele_send(bot, TELE_CHAT_ID, f'Login failed: {e}')
+        tele_send_http(TELE_CHAT_ID, f'❌ Login failed: {e}')
         return
 
-    targets = ['NIFTY 50', 'SENSEX']
-    found = {}
-    for t in targets:
-        info = find_symboltoken_for_query(smartApi, t)
-        if not info:
-            logger.warning('Could not find symbol for %s', t)
-            tele_send(bot, TELE_CHAT_ID, f'Could not find symbol token for {t}.')
-        else:
-            found[t] = info
-
-    if not found:
-        logger.error('No symbols found. Exiting bot loop.')
-        tele_send(bot, TELE_CHAT_ID, 'No symbols found; bot stopped.')
+    tele_send_http(TELE_CHAT_ID, f"✅ Option Chain Bot started!\n⏱ Polling every {POLL_INTERVAL}s")
+    
+    # Download instruments once
+    logger.info("Downloading instruments...")
+    instruments = download_instruments(smartApi)
+    if not instruments:
+        logger.error("Failed to download instruments")
+        tele_send_http(TELE_CHAT_ID, "❌ Failed to download instruments")
         return
-
-    tele_send(bot, TELE_CHAT_ID, f"Bot started. Polling every {POLL_INTERVAL}s for: {', '.join(found.keys())}")
+    
+    expiry = get_current_expiry()
+    logger.info(f"Current expiry: {expiry}")
 
     while True:
-        messages = []
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        for name, info in found.items():
-            ltp = get_ltp(smartApi, 'NSE', info.get('tradingsymbol') or '', info.get('symboltoken') or '')
-            if ltp is None:
-                messages.append(f"{ts} | {name}: LTP not available")
-            else:
-                messages.append(f"{ts} | {name}: {ltp}")
-        text = "\\n".join(messages)
-        logger.info('Sending message:\\n%s', text)
-        tele_send(bot, TELE_CHAT_ID, text)
+        try:
+            # Get spot prices
+            spot_prices = get_spot_prices(smartApi)
+            
+            if not spot_prices:
+                logger.error("Failed to fetch spot prices")
+                time.sleep(POLL_INTERVAL)
+                continue
+            
+            # Process NIFTY
+            if 'NIFTY' in spot_prices:
+                nifty_price = spot_prices['NIFTY']
+                nifty_options = find_option_tokens(instruments, 'NIFTY', expiry, nifty_price)
+                
+                if nifty_options:
+                    ltp_data = get_option_chain_data(smartApi, nifty_options)
+                    if ltp_data:
+                        msg = format_option_chain_message('NIFTY 50', nifty_price, expiry, nifty_options, ltp_data)
+                        tele_send_http(TELE_CHAT_ID, msg)
+                        time.sleep(2)  # Small delay between messages
+            
+            # Process BANKNIFTY
+            if 'BANKNIFTY' in spot_prices:
+                bn_price = spot_prices['BANKNIFTY']
+                bn_options = find_option_tokens(instruments, 'BANKNIFTY', expiry, bn_price)
+                
+                if bn_options:
+                    ltp_data = get_option_chain_data(smartApi, bn_options)
+                    if ltp_data:
+                        msg = format_option_chain_message('BANK NIFTY', bn_price, expiry, bn_options, ltp_data)
+                        tele_send_http(TELE_CHAT_ID, msg)
+            
+        except Exception as e:
+            logger.exception(f"Error in bot loop: {e}")
+            tele_send_http(TELE_CHAT_ID, f"⚠️ Error: {str(e)[:100]}")
+        
         time.sleep(POLL_INTERVAL)
 
-# Start bot in a background thread at import time so Gunicorn/Procfile runs it.
+# Start bot in a background thread
 thread = threading.Thread(target=bot_loop, daemon=True)
 thread.start()
 
-# Minimal Flask app for healthcheck
 @app.route('/')
 def index():
     status = {
         'bot_thread_alive': thread.is_alive(),
-        'poll_interval': POLL_INTERVAL
+        'poll_interval': POLL_INTERVAL,
+        'smartapi_sdk_available': SmartConnect is not None,
+        'service': 'Option Chain Bot'
     }
     return jsonify(status)
 
-# Expose app for gunicorn: `gunicorn main:app`
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'thread_alive': thread.is_alive()})
+
 if __name__ == '__main__':
-    # allow running locally with `python main.py`
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
