@@ -87,6 +87,7 @@ def get_nifty_expiry():
     if days_ahead <= 0:  # If today is Tuesday or later, get next Tuesday
         days_ahead += 7
     expiry = today + timedelta(days=days_ahead)
+    # Format: DDMMMYY (e.g., 07OCT25)
     return expiry.strftime('%d%b%y').upper()
 
 def get_banknifty_expiry():
@@ -100,12 +101,33 @@ def get_banknifty_expiry():
     
     last_day = next_month - timedelta(days=1)
     
-    # Find last Wednesday
-    # Wednesday is 2
+    # Find last Wednesday (weekday 2)
     days_back = (last_day.weekday() - 2) % 7
     last_wednesday = last_day - timedelta(days=days_back)
     
+    # Format: DDMMMYY (e.g., 30OCT25)
     return last_wednesday.strftime('%d%b%y').upper()
+
+def parse_expiry_formats(expiry_str):
+    """Parse different expiry date formats from Angel One
+    Returns datetime object or None
+    """
+    if not expiry_str:
+        return None
+    
+    formats = [
+        '%d%b%Y',  # 07OCT2025
+        '%d%b%y',  # 07OCT25
+        '%Y-%m-%d',  # 2025-10-07
+        '%d-%m-%Y',  # 07-10-2025
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(str(expiry_str), fmt)
+        except:
+            continue
+    return None
 
 def download_instruments(smartApi):
     """Download instrument master file from Angel One"""
@@ -130,13 +152,19 @@ def download_instruments(smartApi):
         logger.exception(f"❌ Failed to download instruments: {e}")
         return None
 
-def find_option_tokens(instruments, symbol, expiry, current_price):
+def find_option_tokens(instruments, symbol, target_expiry, current_price):
     """Find option tokens for strikes around current price"""
     if not instruments:
         logger.error("No instruments available!")
         return []
     
-    logger.info(f"🔍 Finding options for {symbol}, Expiry: {expiry}, Price: {current_price}")
+    logger.info(f"🔍 Finding options for {symbol}, Target Expiry: {target_expiry}, Price: {current_price}")
+    
+    # Parse target expiry
+    target_date = parse_expiry_formats(target_expiry)
+    if not target_date:
+        logger.error(f"Failed to parse target expiry: {target_expiry}")
+        return []
     
     # Calculate ATM and surrounding strikes
     if symbol == "NIFTY":
@@ -154,24 +182,44 @@ def find_option_tokens(instruments, symbol, expiry, current_price):
     logger.info(f"🎯 ATM: {atm}, Looking for strikes: {strikes[:3]}...{strikes[-3:]}")
     
     option_tokens = []
+    expiry_samples = set()
     
     for instrument in instruments:
-        if instrument.get('name') == symbol and instrument.get('expiry') == expiry:
-            strike = float(instrument.get('strike', 0))
-            if strike in strikes:
-                symbol_name = instrument.get('symbol', '')
-                option_type = 'CE' if 'CE' in symbol_name else 'PE'
-                token = instrument.get('token')
-                option_tokens.append({
-                    'strike': strike,
-                    'type': option_type,
-                    'token': token,
-                    'symbol': symbol_name
-                })
+        inst_name = instrument.get('name', '')
+        inst_expiry = instrument.get('expiry', '')
+        
+        # Collect expiry samples for debugging
+        if inst_name == symbol and inst_expiry:
+            expiry_samples.add(inst_expiry)
+            if len(expiry_samples) <= 5:  # Log first 5 unique expiries
+                logger.debug(f"Sample expiry for {symbol}: {inst_expiry}")
+        
+        if inst_name == symbol:
+            # Parse instrument expiry
+            inst_date = parse_expiry_formats(inst_expiry)
+            
+            # Match expiry date
+            if inst_date and inst_date.date() == target_date.date():
+                strike = float(instrument.get('strike', 0))
+                if strike in strikes:
+                    symbol_name = instrument.get('symbol', '')
+                    option_type = 'CE' if 'CE' in symbol_name else 'PE'
+                    token = instrument.get('token')
+                    option_tokens.append({
+                        'strike': strike,
+                        'type': option_type,
+                        'token': token,
+                        'symbol': symbol_name,
+                        'expiry': inst_expiry
+                    })
     
-    logger.info(f"✅ Found {len(option_tokens)} option contracts")
+    logger.info(f"📋 Found {len(expiry_samples)} unique expiries for {symbol}")
+    logger.info(f"✅ Found {len(option_tokens)} option contracts matching {target_expiry}")
+    
     if option_tokens:
         logger.debug(f"Sample options: {option_tokens[:2]}")
+    else:
+        logger.warning(f"⚠️ No options found! Available expiries for {symbol}: {sorted(list(expiry_samples))[:10]}")
     
     return sorted(option_tokens, key=lambda x: (x['strike'], x['type']))
 
